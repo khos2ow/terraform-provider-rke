@@ -6,14 +6,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/sirupsen/logrus"
+
 	"github.com/rancher/rke/cluster"
 	"github.com/rancher/rke/dind"
 	"github.com/rancher/rke/hosts"
 	"github.com/rancher/rke/log"
 	"github.com/rancher/rke/pki"
+	"github.com/rancher/rke/pki/cert"
 	v3 "github.com/rancher/types/apis/management.cattle.io/v3"
 	"github.com/urfave/cli"
-	"k8s.io/client-go/util/cert"
 )
 
 const DINDWaitTime = 3
@@ -75,21 +77,21 @@ func UpCommand() cli.Command {
 	}
 }
 
-func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags cluster.ExternalFlags) (string, string, string, string, map[string]pki.CertificatePKI, error) {
+func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags cluster.ExternalFlags, data map[string]interface{}) (string, string, string, string, map[string]pki.CertificatePKI, error) {
 	var APIURL, caCrt, clientCert, clientKey string
 
 	clusterState, err := cluster.ReadStateFile(ctx, cluster.GetStateFilePath(flags.ClusterFilePath, flags.ConfigDir))
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
-
 	kubeCluster, err := cluster.InitClusterObject(ctx, clusterState.DesiredState.RancherKubernetesEngineConfig.DeepCopy(), flags)
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
+	svcOptionsData := cluster.GetServiceOptionData(data)
 	// check if rotate certificates is triggered
 	if kubeCluster.RancherKubernetesEngineConfig.RotateCertificates != nil {
-		return rebuildClusterWithRotatedCertificates(ctx, dialersOptions, flags)
+		return rebuildClusterWithRotatedCertificates(ctx, dialersOptions, flags, svcOptionsData)
 	}
 
 	log.Infof(ctx, "Building Kubernetes cluster")
@@ -118,7 +120,7 @@ func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags c
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 	if len(kubeCluster.ControlPlaneHosts) > 0 {
-		APIURL = fmt.Sprintf("https://" + kubeCluster.ControlPlaneHosts[0].Address + ":6443")
+		APIURL = fmt.Sprintf("https://%s:6443", kubeCluster.ControlPlaneHosts[0].Address)
 	}
 	clientCert = string(cert.EncodeCertPEM(kubeCluster.Certificates[pki.KubeAdminCertName].Certificate))
 	clientKey = string(cert.EncodePrivateKeyPEM(kubeCluster.Certificates[pki.KubeAdminCertName].Key))
@@ -130,20 +132,20 @@ func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags c
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 
-	err = cluster.ReconcileCluster(ctx, kubeCluster, currentCluster, flags)
+	err = cluster.ReconcileCluster(ctx, kubeCluster, currentCluster, flags, svcOptionsData)
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 	// update APIURL after reconcile
 	if len(kubeCluster.ControlPlaneHosts) > 0 {
-		APIURL = fmt.Sprintf("https://" + kubeCluster.ControlPlaneHosts[0].Address + ":6443")
+		APIURL = fmt.Sprintf("https://%s:6443", kubeCluster.ControlPlaneHosts[0].Address)
 	}
 
 	if err := kubeCluster.PrePullK8sImages(ctx); err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 
-	err = kubeCluster.DeployControlPlane(ctx)
+	err = kubeCluster.DeployControlPlane(ctx, svcOptionsData)
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
@@ -164,7 +166,7 @@ func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags c
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 
-	err = kubeCluster.DeployWorkerPlane(ctx)
+	err = kubeCluster.DeployWorkerPlane(ctx, svcOptionsData)
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
@@ -178,7 +180,7 @@ func ClusterUp(ctx context.Context, dialersOptions hosts.DialersOptions, flags c
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
 
-	err = cluster.ConfigureCluster(ctx, kubeCluster.RancherKubernetesEngineConfig, kubeCluster.Certificates, flags, dialersOptions, false)
+	err = cluster.ConfigureCluster(ctx, kubeCluster.RancherKubernetesEngineConfig, kubeCluster.Certificates, flags, dialersOptions, data, false)
 	if err != nil {
 		return APIURL, caCrt, clientCert, clientKey, nil, err
 	}
@@ -205,6 +207,7 @@ func checkAllIncluded(cluster *cluster.Cluster) error {
 }
 
 func clusterUpFromCli(ctx *cli.Context) error {
+	logrus.Infof("Running RKE version: %v", ctx.App.Version)
 	if ctx.Bool("local") {
 		return clusterUpLocal(ctx)
 	}
@@ -239,7 +242,7 @@ func clusterUpFromCli(ctx *cli.Context) error {
 		return err
 	}
 
-	_, _, _, _, _, err = ClusterUp(context.Background(), hosts.DialersOptions{}, flags)
+	_, _, _, _, _, err = ClusterUp(context.Background(), hosts.DialersOptions{}, flags, map[string]interface{}{})
 	return err
 }
 
@@ -270,7 +273,7 @@ func clusterUpLocal(ctx *cli.Context) error {
 	if err := ClusterInit(context.Background(), rkeConfig, dialers, flags); err != nil {
 		return err
 	}
-	_, _, _, _, _, err = ClusterUp(context.Background(), dialers, flags)
+	_, _, _, _, _, err = ClusterUp(context.Background(), dialers, flags, map[string]interface{}{})
 	return err
 }
 
@@ -298,7 +301,7 @@ func clusterUpDind(ctx *cli.Context) error {
 		return err
 	}
 	// start cluster
-	_, _, _, _, _, err = ClusterUp(context.Background(), dialers, flags)
+	_, _, _, _, _, err = ClusterUp(context.Background(), dialers, flags, map[string]interface{}{})
 	return err
 }
 
